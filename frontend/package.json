@@ -1,0 +1,11 @@
+{
+  "name": "ibm-bob-2-0-hackathon-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Frontend for the IBM Bob 2.0 hackathon project. Owner: Tiffany.",
+  "scripts": {
+    "dev": "echo \"TODO: wire up dev server\"",
+    "build": "echo \"TODO: wire up build\"",
+    "test": "echo \"TODO: add tests\""
+  }
+}
