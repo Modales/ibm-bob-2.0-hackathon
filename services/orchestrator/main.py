@@ -8,13 +8,14 @@ FastAPI front door for the full modernization pipeline. All heavy lifting
 lives in the five sibling subsystems, wired together through the asyncio
 event bus — this module only translates HTTP <-> bus events:
 
-    POST /api/v1/modernize
+    POST /api/v1/modernize  (JWT-protected)
         AUDIT_STARTED -> auditor (live/mock) -> AUDIT_FINISHED
         -> vector CVE lookup        -> CVE_RETRIEVED
         -> IBM Bob refactor + AST gate -> REFACTOR_PROPOSED
         -> 3-persona debate         -> CONSENSUS_REACHED
         -> self-healing sandbox loop -> TESTS_PASSED / TESTS_FAILED
         -> PIPELINE_COMPLETE
+        + ROI summary + Prometheus metrics on every run
 
     GET /api/v1/stream-logs?repo_path=...&target_version=...
         Runs the same pipeline in the background and streams every bus event
@@ -22,16 +23,22 @@ event bus — this module only translates HTTP <-> bus events:
 
 Subsystems (same directory)
 ---------------------------
-* ``vector_cve_db.py``        — RAG security engine
-* ``multi_agent_consensus.py``— debate & resolution engine
-* ``self_healing_loop.py``    — autonomous retry engine
-* ``ast_mutation_engine.py``  — deep structural verification
-* ``master_event_bus.py``     — asynchronous event router
+* ``vector_cve_db.py``         — RAG security engine
+* ``multi_agent_consensus.py`` — debate & resolution engine
+* ``self_healing_loop.py``     — autonomous retry engine
+* ``ast_mutation_engine.py``   — deep structural verification
+* ``master_event_bus.py``      — asynchronous event router
+* ``roi_calculator.py``        — business value engine
+* ``observability_exporter.py``— Prometheus metrics
+* ``cross_language_parser.py`` — polyglot static analysis
+* ``enterprise_auth.py``       — zero-trust JWT layer
 
 Run locally
 -----------
     pip install -r requirements.txt
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+Demo credentials: ``admin`` / ``bob-hackathon-2026`` at ``POST /token``.
 """
 
 from __future__ import annotations
@@ -47,7 +54,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, Query
+from fastapi import Depends, FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -64,6 +71,14 @@ from vector_cve_db import (  # noqa: E402
 from multi_agent_consensus import ConsensusResult, reach_consensus  # noqa: E402
 from self_healing_loop import HealResult, self_heal_code  # noqa: E402
 from ast_mutation_engine import VerificationReport, verify_refactor  # noqa: E402
+from roi_calculator import ROISummary, calculate_roi  # noqa: E402
+from observability_exporter import (  # noqa: E402
+    record_debate_duration,
+    record_pipeline_run,
+    render_metrics,
+)
+from cross_language_parser import PolyglotFinding, scan_repository  # noqa: E402
+from enterprise_auth import EnterpriseUser, auth_router, get_current_user  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("orchestrator.main")
@@ -111,6 +126,8 @@ class RefactorResult(BaseModel):
     consensus_score: Optional[float] = None
     ast_violations: List[str] = Field(default_factory=list)
     healing_attempts: Optional[int] = None
+    loop_depth_before: int = 0
+    loop_depth_after: int = 0
 
 
 class ModernizationResponse(BaseModel):
@@ -124,6 +141,7 @@ class ModernizationResponse(BaseModel):
     cve_hits: List[Dict[str, Any]]
     refactors: List[RefactorResult]
     sandbox_report: Dict[str, Any]
+    roi_summary: ROISummary
     pipeline_success: bool
     execution_logs: List[str]
     event_timeline: List[str]
@@ -147,7 +165,13 @@ def make_log(message: str) -> str:
 # ---------------------------------------------------------------------------
 
 async def call_auditor(request: ModernizationRequest, logs: List[str]) -> tuple[List[VulnerabilityItem], str]:
-    """POST the repo to the auditor service; deterministic mock on failure."""
+    """
+    POST the repo to the auditor service; deterministic mock on failure.
+
+    In mock mode the polyglot static scanner (``cross_language_parser``) also
+    sweeps ``repo_path`` for JS/TS/Java/Python findings so the demo works on
+    real repositories without any teammate service running.
+    """
     logs.append(make_log(f"Scanning files... POST {AUDITOR_URL}"))
     try:
         async with httpx.AsyncClient(timeout=DOWNSTREAM_TIMEOUT_SECONDS) as client:
@@ -171,6 +195,14 @@ async def call_auditor(request: ModernizationRequest, logs: List[str]) -> tuple[
                 severity="high",
             ),
         ]
+        # Polyglot sweep of the real repo path (no-op when it doesn't exist).
+        polyglot: List[PolyglotFinding] = await scan_repository(request.repo_path)
+        if polyglot:
+            logs.append(make_log(f"Polyglot scanner added {len(polyglot)} finding(s) from {request.repo_path}."))
+            mock.extend(VulnerabilityItem(
+                file_path=f.file_path, line_number=f.line_number,
+                description=f"[{f.rule_id}] {f.description}", severity=f.severity,
+            ) for f in polyglot)
         logs.append(make_log(f"Mock scan complete: {len(mock)} finding(s)."))
         return mock, "mock"
 
@@ -249,6 +281,7 @@ class PipelineContext:
         self.cve_hits: List[CVEQueryResult] = []
         self.refactors: List[RefactorResult] = []
         self.sandbox_report: Dict[str, Any] = {}
+        self.debate_durations: List[Dict[str, Any]] = []  # for the metrics exporter
         self.success = False
         # Set once the CVE stage has proposed every refactor; completion
         # checks must ignore refactor work that hasn't been proposed yet.
@@ -301,6 +334,8 @@ async def run_pipeline(request: ModernizationRequest, event_sink: "Optional[asyn
                 continue
             ctx.refactors.append(RefactorResult(
                 original_code=original, refactored_code=agent["refactored_code"], status="proposed",
+                loop_depth_before=gate.max_loop_depth_original,
+                loop_depth_after=gate.max_loop_depth_refactored,
             ))
             await bus.emit(Topic.REFACTOR_PROPOSED, {"file": vuln.file_path})
         ctx.proposals_done = True
@@ -314,9 +349,14 @@ async def run_pipeline(request: ModernizationRequest, event_sink: "Optional[asyn
         # Process refactors serially: find the next one still in 'proposed'.
         idx = next(i for i, r in enumerate(ctx.refactors) if r.status == "proposed")
         vuln = ctx.vulnerabilities[min(idx, len(ctx.vulnerabilities) - 1)]
+        debate_started = time.perf_counter()
         result: ConsensusResult = await reach_consensus(
             ctx.refactors[idx].original_code, ctx.refactors[idx].refactored_code, vuln.model_dump(),
         )
+        debate_seconds = time.perf_counter() - debate_started
+        # Metrics: debate-duration histogram (fire-and-forget).
+        record_debate_duration(debate_seconds, result.approved)
+        ctx.debate_durations.append({"seconds": debate_seconds, "approved": result.approved})
         ctx.logs.extend(make_log(f"DEBATE {line}") for line in result.transcript)
         ctx.refactors[idx].consensus_score = result.consensus_score
         ctx.refactors[idx].status = "consensus_passed" if result.approved else "rejected_consensus"
@@ -390,21 +430,28 @@ async def run_pipeline(request: ModernizationRequest, event_sink: "Optional[asyn
 
 app = FastAPI(
     title="IBM Bob 2.0 — Orchestrator",
-    version="0.2.0",
-    description="Bus-driven modernization pipeline: audit -> CVE RAG -> IBM Bob -> consensus -> self-heal.",
+    version="0.3.0",
+    description="Bus-driven modernization pipeline: audit -> CVE RAG -> IBM Bob -> consensus -> self-heal, with zero-trust auth, ROI analytics and Prometheus metrics.",
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Zero-trust auth router: POST /token issues JWTs for the enterprise IdP.
+app.include_router(auth_router)
 
 
 @app.get("/")
 async def root() -> Dict[str, Any]:
     return {
         "service": "ibm-bob-2.0-orchestrator",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "auditor_url": AUDITOR_URL,
         "sandbox_url": SANDBOX_URL,
         "ibm_bob_mode": "cli" if IBM_BOB_CLI else "simulation",
-        "subsystems": ["vector_cve_db", "multi_agent_consensus", "self_healing_loop", "ast_mutation_engine", "master_event_bus"],
+        "subsystems": [
+            "vector_cve_db", "multi_agent_consensus", "self_healing_loop",
+            "ast_mutation_engine", "master_event_bus", "roi_calculator",
+            "observability_exporter", "cross_language_parser", "enterprise_auth",
+        ],
     }
 
 
@@ -413,13 +460,46 @@ async def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/metrics")
+async def metrics() -> Response:
+    """
+    Prometheus scrape endpoint (text exposition format).
+
+    Intentionally unauthenticated: Prometheus scrapers typically do not carry
+    user credentials; protect via network policy in production.
+    """
+    return Response(content=render_metrics(), media_type="text/plain; version=0.0.4")
+
+
 @app.post("/api/v1/modernize", response_model=ModernizationResponse)
-async def modernize(request: ModernizationRequest) -> ModernizationResponse:
-    """Master orchestration route — runs the full bus-driven pipeline."""
+async def modernize(
+    request: ModernizationRequest,
+    user: EnterpriseUser = Depends(get_current_user),
+) -> ModernizationResponse:
+    """
+    Master orchestration route — runs the full bus-driven pipeline.
+
+    **Zero-trust protected**: requires a Bearer JWT with the ``modernizer``
+    role (obtain via ``POST /token``). Every run feeds Prometheus metrics and
+    returns an ROI summary for the business dashboard.
+    """
+    logger.info("Pipeline triggered by user '%s' (role=%s).", user.username, user.role)
     started = time.perf_counter()
     ctx = await run_pipeline(request)
     duration_ms = int((time.perf_counter() - started) * 1000)
     ctx.logs.append(make_log(f"Pipeline complete in {duration_ms} ms. success={ctx.success}"))
+
+    # Metrics: patch counter + rolling pass rate (never raises).
+    record_pipeline_run(
+        refactors=[r.model_dump() for r in ctx.refactors],
+        vulnerabilities=[v.model_dump() for v in ctx.vulnerabilities],
+    )
+
+    # Business value summary for the frontend dashboard.
+    roi = await calculate_roi(
+        refactors=[r.model_dump() for r in ctx.refactors],
+        vulnerabilities=[v.model_dump() for v in ctx.vulnerabilities],
+    )
 
     return ModernizationResponse(
         repo_path=request.repo_path,
@@ -431,6 +511,7 @@ async def modernize(request: ModernizationRequest) -> ModernizationResponse:
                    "score": h.score, "fixed_version": h.cve.fixed_version} for h in ctx.cve_hits],
         refactors=ctx.refactors,
         sandbox_report=ctx.sandbox_report,
+        roi_summary=roi,
         pipeline_success=ctx.success,
         execution_logs=ctx.logs,
         event_timeline=ctx.timeline,
