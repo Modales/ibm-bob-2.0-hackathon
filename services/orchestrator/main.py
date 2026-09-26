@@ -164,6 +164,40 @@ def make_log(message: str) -> str:
 # External clients with mock fallbacks (auditor + IBM Bob)
 # ---------------------------------------------------------------------------
 
+def _adapt_auditor_payload(data: Dict[str, Any]) -> List[VulnerabilityItem]:
+    """
+    Normalize any auditor response shape into ``VulnerabilityItem`` records.
+
+    Supported contracts:
+      * **Native** — ``{"vulnerabilities": [{file_path, line_number, ...}]}``.
+      * **Muhammed's auditor** — ``{"risk_score", "high_risk_files",
+        "findings": [{"type": "taint", "issues": [{file, line, variable,
+        source, sink}]}, ...]}``. Taint issues map to vulnerabilities with
+        severity derived from the sink class (SQL sinks are ``high``).
+    """
+    if isinstance(data.get("vulnerabilities"), list):
+        return [VulnerabilityItem(**v) for v in data["vulnerabilities"]]
+
+    items: List[VulnerabilityItem] = []
+    for block in data.get("findings", []):
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "taint":
+            for issue in block.get("issues", []):
+                sink = str(issue.get("sink", ""))
+                severity = "high" if "execute" in sink else "medium"
+                items.append(VulnerabilityItem(
+                    file_path=str(issue.get("file", "unknown")),
+                    line_number=int(issue.get("line", 0)),
+                    description=(
+                        f"Taint flow: {issue.get('source', '?')} reaches "
+                        f"{sink} via '{issue.get('variable', '?')}' (unsanitized)."
+                    ),
+                    severity=severity,
+                ))
+    return items
+
+
 async def call_auditor(request: ModernizationRequest, logs: List[str]) -> tuple[List[VulnerabilityItem], str]:
     """
     POST the repo to the auditor service; deterministic mock on failure.
@@ -177,7 +211,7 @@ async def call_auditor(request: ModernizationRequest, logs: List[str]) -> tuple[
         async with httpx.AsyncClient(timeout=DOWNSTREAM_TIMEOUT_SECONDS) as client:
             resp = await client.post(AUDITOR_URL, json=request.model_dump())
             resp.raise_for_status()
-            items = [VulnerabilityItem(**v) for v in resp.json().get("vulnerabilities", [])]
+            items = _adapt_auditor_payload(resp.json())
             logs.append(make_log(f"Auditor responded: {len(items)} finding(s)."))
             return items, "live"
     except Exception as exc:
