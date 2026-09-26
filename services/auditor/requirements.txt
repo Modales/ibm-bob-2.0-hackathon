@@ -1,1 +1,3 @@
-# Auditor service dependencies — add below as needed.
+fastapi
+uvicorn[standard]
+gitpython
