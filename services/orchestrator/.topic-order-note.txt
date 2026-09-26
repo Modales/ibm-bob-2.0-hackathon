@@ -1,0 +1,10 @@
+class Topic(str, Enum):
+    AUDIT_STARTED = "audit.started"
+    AUDIT_FINISHED = "audit.finished"
+    CVE_RETRIEVED = "cve.retrieved"
+    REFACTOR_PROPOSED = "refactor.proposed"
+    CONSENSUS_REACHED = "consensus.reached"
+    HEALING_FINISHED = "healing.finished"
+    TESTS_PASSED = "tests.passed"
+    TESTS_FAILED = "tests.failed"
+    PIPELINE_COMPLETE = "pipeline.complete"
