@@ -383,7 +383,7 @@ def scan_repo(
     Combined list of :class:`Finding` dicts from all Python files,
     sorted by (file, line).
     """
-    root = Path(repo_path)
+    root = Path(repo_path).resolve()
     _skip = DEFAULT_SKIP_DIRS if skip_dirs is None else frozenset(skip_dirs)
 
     all_findings: list[Finding] = []
@@ -397,6 +397,9 @@ def scan_repo(
             if not name.endswith(".py"):
                 continue
             py_file = Path(dirpath) / name
-            all_findings.extend(scan_file(py_file))
+            rel_posix = py_file.relative_to(root).as_posix()
+            for finding in scan_file(py_file):
+                finding["file"] = rel_posix
+                all_findings.append(finding)
 
     return sorted(all_findings, key=lambda f: (f["file"], f["line"]))
