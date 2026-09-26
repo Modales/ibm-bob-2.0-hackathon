@@ -4,7 +4,10 @@ uvicorn[standard]>=0.30
 pydantic>=2.7
 httpx>=0.27
 
-# Optional heavyweight backends — every module runs standalone without these,
-# but installing them upgrades mocks to the real thing:
+# Enterprise layer (used when installed; every module has a stdlib fallback):
+prometheus-client>=0.20   # /metrics endpoint (observability_exporter.py)
+python-jose>=3.3          # JWT signing (enterprise_auth.py)
+
+# Optional heavyweight backends — installing them upgrades mocks to the real thing:
 #   sentence-transformers>=2.7   # semantic CVE embeddings (vector_cve_db.py)
 #   faiss-cpu>=1.8               # ANN index for large CVE catalogs
