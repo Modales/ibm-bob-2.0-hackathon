@@ -205,6 +205,29 @@ class _TaintVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     # ------------------------------------------------------------------
+    # Function scope — isolate taint per function
+    # ------------------------------------------------------------------
+
+    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        """Visit a function with a fresh, isolated taint scope.
+
+        Saves the current ``_tainted`` dict, resets it to empty (so outer
+        taint does not leak in), visits the function body, then restores
+        the saved dict (so the function's locals do not leak out).
+        Function parameters are never pre-tainted — they start clean.
+        """
+        saved = self._tainted
+        self._tainted = {}
+        self.generic_visit(node)
+        self._tainted = saved
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function(node)
+
+    # ------------------------------------------------------------------
     # Call expressions — detect sinks
     # ------------------------------------------------------------------
 
@@ -327,13 +350,33 @@ def scan_file(filepath: str | Path) -> list[Finding]:
     return visitor.findings
 
 
-def scan_repo(repo_path: str | Path) -> list[Finding]:
+#: Default set of directory names that are never Python source and should be
+#: skipped when walking a repository tree.
+DEFAULT_SKIP_DIRS: frozenset[str] = frozenset({
+    ".git", ".hg", ".svn",
+    "node_modules",
+    "venv", ".venv", "env", ".env",
+    "__pycache__", ".mypy_cache", ".pytest_cache",
+    "dist", "build", ".tox",
+    "site-packages",
+})
+
+
+def scan_repo(
+    repo_path: str | Path,
+    skip_dirs: frozenset[str] | set[str] | None = None,
+) -> list[Finding]:
     """Walk *repo_path* recursively, scanning every ``*.py`` file.
 
     Parameters
     ----------
     repo_path:
         Root directory of a locally cloned repository.
+    skip_dirs:
+        Directory names to skip entirely when walking the tree.  Any path
+        component that matches a name in this set causes the whole subtree to
+        be skipped.  Defaults to :data:`DEFAULT_SKIP_DIRS`.  Directory names
+        that start with ``.`` are *always* skipped regardless of this set.
 
     Returns
     -------
@@ -341,11 +384,19 @@ def scan_repo(repo_path: str | Path) -> list[Finding]:
     sorted by (file, line).
     """
     root = Path(repo_path)
+    _skip = DEFAULT_SKIP_DIRS if skip_dirs is None else frozenset(skip_dirs)
+
     all_findings: list[Finding] = []
-    for py_file in sorted(root.rglob("*.py")):
-        # Skip virtualenvs and hidden directories
-        parts = py_file.relative_to(root).parts
-        if any(p.startswith(".") or p in {"venv", ".venv", "site-packages"} for p in parts):
-            continue
-        all_findings.extend(scan_file(py_file))
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune skipped directories in-place so os.walk won't descend into them.
+        dirnames[:] = [
+            d for d in dirnames
+            if not d.startswith(".") and d not in _skip
+        ]
+        for name in sorted(filenames):
+            if not name.endswith(".py"):
+                continue
+            py_file = Path(dirpath) / name
+            all_findings.extend(scan_file(py_file))
+
     return sorted(all_findings, key=lambda f: (f["file"], f["line"]))
